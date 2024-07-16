@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,20 +18,6 @@ import (
 	"github.com/patrickmn/go-cache"
 )
 
-var c = cache.New(cache.NoExpiration, time.Minute*10)
-
-func main() {
-	http.HandleFunc("/tts", handleTTSRequest)
-	http.HandleFunc("/status", handleStatusRequest)
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	fmt.Printf("Listening on :%s\n", port)
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
-}
-
 type TTSRequest struct {
 	Text        string `json:"text"`
 	Language    string `json:"language"`
@@ -45,6 +32,69 @@ type TTSRequest struct {
 type CacheEntry struct {
 	Audio []byte
 	Type  string
+}
+
+var c = cache.New(cache.NoExpiration, cache.NoExpiration)
+var tempC = cache.New(time.Minute*5, time.Minute*10)
+var persist = os.Getenv("PERSIST_CACHE") != "false"
+
+func init() {
+	gob.Register(CacheEntry{})
+}
+
+func main() {
+	http.HandleFunc("/tts", handleTTSRequest)
+	http.HandleFunc("/status", handleStatusRequest)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	if persist {
+		loadCache()
+	}
+
+	fmt.Printf("Listening on :%s\n", port)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), nil))
+}
+
+func loadCache() {
+	file, err := os.Open("cache-data.bin")
+	if err != nil {
+		log.Println("Cache file not found. Starting with empty cache.")
+		return
+	}
+	defer file.Close()
+
+	decoder := gob.NewDecoder(file)
+	var items map[string]cache.Item
+	err = decoder.Decode(&items)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for key, value := range items {
+		c.Set(key, value.Object.(CacheEntry), cache.DefaultExpiration)
+	}
+
+	log.Println("Cache loaded from binary file, items count:", c.ItemCount())
+}
+
+func saveCache() {
+	file, err := os.Create("cache-data.bin")
+	if err != nil {
+		log.Println("Failed to create cache file", err)
+	}
+	defer file.Close()
+
+	encoder := gob.NewEncoder(file)
+	err = encoder.Encode(c.Items())
+	if err != nil {
+		log.Println("Failed to save cache", err)
+		return
+	}
+
+	log.Println("Cache saved to binary file")
 }
 
 func handleStatusRequest(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +151,14 @@ func handleTTSRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if val, ok := tempC.Get(ttsRequest.Text); ok {
+		value := val.(CacheEntry)
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.Header().Set("Content-Type", value.Type)
+		w.Write(value.Audio)
+		return
+	}
+
 	azureUrl, _ := url.Parse(fmt.Sprintf("https://%s.tts.speech.microsoft.com/cognitiveservices/v1", ttsRequest.AzureRegion))
 	requestBody := fmt.Sprintf(`
       <speak version='1.0' xml:lang='en-US'>
@@ -111,9 +169,10 @@ func handleTTSRequest(w http.ResponseWriter, r *http.Request) {
         </voice>
       </speak>	
 	`, ttsRequest.Language, ttsRequest.Gender, ttsRequest.Name, ttsRequest.Style, ttsRequest.Text)
+
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/ssml+xml")
-	headers.Set("X-Microsoft-OutputFormat", "audio-16khz-128kbitrate-mono-mp3")
+	headers.Set("X-Microsoft-OutputFormat", "audio-16khz-64kbitrate-mono-mp3")
 	headers.Set("Ocp-Apim-Subscription-Key", ttsRequest.AzureKey)
 	headers.Set("User-Agent", "node")
 
@@ -132,7 +191,7 @@ func handleTTSRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	fmt.Println("received response from azure", time.Since(start))
+	fmt.Println("received response from azure", resp.Header.Get("X-Envoy-Upstream-Service-Time"), time.Since(start))
 
 	if resp.StatusCode != http.StatusOK {
 		http.Error(w, fmt.Sprintf("Azure returned %d", resp.StatusCode), http.StatusInternalServerError)
@@ -143,17 +202,23 @@ func handleTTSRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Transfer-Encoding", "chunked")
 
 	var buffer = &bytes.Buffer{}
-	io.Copy(buffer, resp.Body)
+	multi := io.MultiWriter(w, buffer)
+	io.Copy(multi, resp.Body)
+	fmt.Println("copied response to buffer", time.Since(start))
 
-	exp := time.Minute * 5
-	if ttsRequest.ShouldCache {
-		exp = cache.NoExpiration
-	}
-
-	c.Set(ttsRequest.Text, CacheEntry{
+	entry := CacheEntry{
 		Audio: buffer.Bytes(),
 		Type:  resp.Header.Get("Content-Type"),
-	}, exp)
+	}
+	if ttsRequest.ShouldCache {
+		c.Set(ttsRequest.Text, entry, cache.NoExpiration)
+	} else {
+		tempC.Set(ttsRequest.Text, entry, time.Minute*5)
+	}
 
-	w.Write(buffer.Bytes())
+	if persist && ttsRequest.ShouldCache {
+		go func() {
+			saveCache()
+		}()
+	}
 }
